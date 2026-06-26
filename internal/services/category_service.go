@@ -11,16 +11,19 @@ import (
 
 type CategoryService struct {
 	categoryRepo *repository.CategoryRepository
+	postRepo     *repository.PostRepository
 }
 
-func NewCategoryService(categoryRepo *repository.CategoryRepository) *CategoryService {
-	return &CategoryService{categoryRepo: categoryRepo}
+func NewCategoryService(categoryRepo *repository.CategoryRepository, postRepo *repository.PostRepository) *CategoryService {
+	return &CategoryService{
+		categoryRepo: categoryRepo,
+		postRepo:     postRepo,
+	}
 }
 
 func (s *CategoryService) Create(req models.CreateCategoryRequest) (*models.Category, error) {
 	slug := generateSlug(req.Name)
 
-	// Check if slug already exists
 	existing, _ := s.categoryRepo.FindBySlug(slug)
 	if existing != nil {
 		return nil, errors.New("category with this name already exists")
@@ -58,12 +61,12 @@ func (s *CategoryService) Update(id uint, req models.UpdateCategoryRequest) (*mo
 
 	newSlug := generateSlug(req.Name)
 
-	// Check if new slug is taken by another category
 	existing, _ := s.categoryRepo.FindBySlug(newSlug)
 	if existing != nil && existing.ID != id {
 		return nil, errors.New("category with this name already exists")
 	}
 
+	nameChanged := category.Name != req.Name || category.Slug != newSlug
 	category.Name = req.Name
 	category.Slug = newSlug
 
@@ -71,31 +74,32 @@ func (s *CategoryService) Update(id uint, req models.UpdateCategoryRequest) (*mo
 		return nil, err
 	}
 
+	if nameChanged && s.postRepo != nil {
+		_ = s.postRepo.PropagateCategoryRename(category.ID, category.Name, category.Slug)
+	}
+
 	return category, nil
 }
 
 func (s *CategoryService) Delete(id uint) error {
-	return s.categoryRepo.Delete(id)
+	if err := s.categoryRepo.Delete(id); err != nil {
+		return err
+	}
+	// Clear the (now-dangling) reference from any posts in this category.
+	if s.postRepo != nil {
+		_ = s.postRepo.ClearCategoryFromPosts(id)
+	}
+	return nil
 }
 
 // generateSlug creates a URL-friendly slug from a string
 func generateSlug(s string) string {
-	// Convert to lowercase
 	slug := strings.ToLower(s)
-
-	// Replace spaces with hyphens
 	slug = strings.ReplaceAll(slug, " ", "-")
-
-	// Remove special characters
 	reg := regexp.MustCompile("[^a-z0-9-]+")
 	slug = reg.ReplaceAllString(slug, "")
-
-	// Remove multiple consecutive hyphens
 	reg = regexp.MustCompile("-+")
 	slug = reg.ReplaceAllString(slug, "-")
-
-	// Trim hyphens from start and end
 	slug = strings.Trim(slug, "-")
-
 	return slug
 }

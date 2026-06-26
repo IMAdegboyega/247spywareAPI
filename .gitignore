@@ -1,0 +1,33 @@
+# Environment files (use .env.example as the template)
+.env
+.env.local
+.env.*.local
+
+# Compiled binaries
+/server
+/bin/
+*.exe
+*.test
+*.out
+
+# Local SQLite databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local uploads
+/uploads/
+!/uploads/.gitkeep
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Go
+vendor/
+coverage.out

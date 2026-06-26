@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -14,12 +15,49 @@ import (
 type PostService struct {
 	postRepo       *repository.PostRepository
 	subscriberRepo *repository.SubscriberRepository
+	userRepo       *repository.UserRepository
+	categoryRepo   *repository.CategoryRepository
+	emailService   *EmailService
 }
 
-func NewPostService(postRepo *repository.PostRepository, subscriberRepo *repository.SubscriberRepository) *PostService {
+func NewPostService(
+	postRepo *repository.PostRepository,
+	subscriberRepo *repository.SubscriberRepository,
+	userRepo *repository.UserRepository,
+	categoryRepo *repository.CategoryRepository,
+	email *EmailService,
+) *PostService {
 	return &PostService{
 		postRepo:       postRepo,
 		subscriberRepo: subscriberRepo,
+		userRepo:       userRepo,
+		categoryRepo:   categoryRepo,
+		emailService:   email,
+	}
+}
+
+// hydrateEmbedded fills post.Author + post.Category from the related collections
+// before the post is written to the database. Called from Create and from
+// Update whenever the relevant ids changed.
+func (s *PostService) hydrateEmbedded(post *models.Post) {
+	if post.AuthorID != 0 {
+		if u, err := s.userRepo.FindByID(post.AuthorID); err == nil {
+			post.Author = &models.EmbeddedAuthor{
+				ID:          u.ID,
+				DisplayName: u.DisplayName,
+			}
+		}
+	}
+	if post.CategoryID != nil && *post.CategoryID != 0 {
+		if c, err := s.categoryRepo.FindByID(*post.CategoryID); err == nil {
+			post.Category = &models.EmbeddedCategory{
+				ID:   c.ID,
+				Name: c.Name,
+				Slug: c.Slug,
+			}
+		}
+	} else {
+		post.Category = nil
 	}
 }
 
@@ -41,12 +79,10 @@ func (s *PostService) Create(req models.CreatePostRequest, authorID uint) (*mode
 		Status:     status,
 	}
 
-	// Handle scheduled posts
 	if status == models.StatusScheduled && req.ScheduledFor != nil {
 		post.ScheduledFor = req.ScheduledFor
 	}
 
-	// If publishing immediately
 	if status == models.StatusPublished {
 		now := time.Now()
 		post.PublishedAt = &now
@@ -54,14 +90,19 @@ func (s *PostService) Create(req models.CreatePostRequest, authorID uint) (*mode
 		post.LatestNewsAt = &now
 	}
 
+	s.hydrateEmbedded(post)
+
 	if err := s.postRepo.Create(post); err != nil {
 		return nil, err
 	}
 
-	// If published, notify subscribers
 	if status == models.StatusPublished {
 		go s.notifySubscribers(post)
 	}
+
+	// Tell the admin a new post just landed (skip if the admin created it
+	// themselves — they already know).
+	go s.notifyAdminNewPost(post)
 
 	return s.postRepo.FindByID(post.ID)
 }
@@ -76,9 +117,8 @@ func (s *PostService) GetBySlug(slug string) (*models.Post, error) {
 		return nil, err
 	}
 
-	// Increment view count
 	if post.Status == models.StatusPublished {
-		s.postRepo.IncrementViewCount(post.ID)
+		_ = s.postRepo.IncrementViewCount(post.ID)
 		post.ViewCount++
 	}
 
@@ -90,19 +130,7 @@ func (s *PostService) GetAllPosts(page, perPage int) (*models.PaginatedResponse,
 	if err != nil {
 		return nil, err
 	}
-
-	totalPages := int(total) / perPage
-	if int(total)%perPage > 0 {
-		totalPages++
-	}
-
-	return &models.PaginatedResponse{
-		Data:       posts,
-		Total:      total,
-		Page:       page,
-		PerPage:    perPage,
-		TotalPages: totalPages,
-	}, nil
+	return paginated(posts, total, page, perPage), nil
 }
 
 func (s *PostService) GetPublishedPosts(page, perPage int) (*models.PaginatedResponse, error) {
@@ -110,19 +138,7 @@ func (s *PostService) GetPublishedPosts(page, perPage int) (*models.PaginatedRes
 	if err != nil {
 		return nil, err
 	}
-
-	totalPages := int(total) / perPage
-	if int(total)%perPage > 0 {
-		totalPages++
-	}
-
-	return &models.PaginatedResponse{
-		Data:       posts,
-		Total:      total,
-		Page:       page,
-		PerPage:    perPage,
-		TotalPages: totalPages,
-	}, nil
+	return paginated(posts, total, page, perPage), nil
 }
 
 func (s *PostService) GetLatestNews(limit int) ([]models.Post, error) {
@@ -137,19 +153,7 @@ func (s *PostService) GetPostsByCategory(categoryID uint, page, perPage int) (*m
 	if err != nil {
 		return nil, err
 	}
-
-	totalPages := int(total) / perPage
-	if int(total)%perPage > 0 {
-		totalPages++
-	}
-
-	return &models.PaginatedResponse{
-		Data:       posts,
-		Total:      total,
-		Page:       page,
-		PerPage:    perPage,
-		TotalPages: totalPages,
-	}, nil
+	return paginated(posts, total, page, perPage), nil
 }
 
 func (s *PostService) Update(id uint, req models.UpdatePostRequest, userID uint, isAdmin bool) (*models.Post, error) {
@@ -158,12 +162,13 @@ func (s *PostService) Update(id uint, req models.UpdatePostRequest, userID uint,
 		return nil, errors.New("post not found")
 	}
 
-	// Check permission (authors can only edit their own posts)
 	if !isAdmin && post.AuthorID != userID {
 		return nil, errors.New("unauthorized to edit this post")
 	}
 
+	prevStatus := post.Status
 	wasPublished := post.Status == models.StatusPublished
+	categoryChanged := false
 
 	if req.Title != "" {
 		post.Title = req.Title
@@ -176,6 +181,9 @@ func (s *PostService) Update(id uint, req models.UpdatePostRequest, userID uint,
 		post.Excerpt = req.Excerpt
 	}
 	if req.CategoryID != nil {
+		if post.CategoryID == nil || *post.CategoryID != *req.CategoryID {
+			categoryChanged = true
+		}
 		post.CategoryID = req.CategoryID
 	}
 	if req.BannerImage != "" {
@@ -184,7 +192,6 @@ func (s *PostService) Update(id uint, req models.UpdatePostRequest, userID uint,
 	if req.Status != "" {
 		post.Status = req.Status
 
-		// Handle status changes
 		if req.Status == models.StatusPublished && !wasPublished {
 			now := time.Now()
 			post.PublishedAt = &now
@@ -196,6 +203,16 @@ func (s *PostService) Update(id uint, req models.UpdatePostRequest, userID uint,
 		if req.Status == models.StatusScheduled && req.ScheduledFor != nil {
 			post.ScheduledFor = req.ScheduledFor
 		}
+
+		// "Post taken down" — only fire when transitioning from published
+		// (the only state where a post is visible publicly) to offline.
+		if req.Status == models.StatusOffline && prevStatus == models.StatusPublished {
+			go s.notifyPostTakenDown(post)
+		}
+	}
+
+	if categoryChanged {
+		s.hydrateEmbedded(post)
 	}
 
 	if err := s.postRepo.Update(post); err != nil {
@@ -211,11 +228,11 @@ func (s *PostService) UpdateStatus(id uint, status models.PostStatus, userID uin
 		return nil, errors.New("post not found")
 	}
 
-	// Check permission
 	if !isAdmin && post.AuthorID != userID {
 		return nil, errors.New("unauthorized to update this post")
 	}
 
+	prevStatus := post.Status
 	wasPublished := post.Status == models.StatusPublished
 	post.Status = status
 
@@ -225,6 +242,10 @@ func (s *PostService) UpdateStatus(id uint, status models.PostStatus, userID uin
 		post.IsLatestNews = true
 		post.LatestNewsAt = &now
 		go s.notifySubscribers(post)
+	}
+
+	if status == models.StatusOffline && prevStatus == models.StatusPublished {
+		go s.notifyPostTakenDown(post)
 	}
 
 	if err := s.postRepo.Update(post); err != nil {
@@ -240,7 +261,6 @@ func (s *PostService) AutoSave(id uint, content string, title string, userID uin
 		return nil, errors.New("post not found")
 	}
 
-	// Check permission
 	if !isAdmin && post.AuthorID != userID {
 		return nil, errors.New("unauthorized to edit this post")
 	}
@@ -285,7 +305,9 @@ func (s *PostService) PublishScheduledPosts() error {
 			continue
 		}
 
-		go s.notifySubscribers(&post)
+		p := post // copy so the goroutines capture a stable value
+		go s.notifySubscribers(&p)
+		go s.notifyScheduledPostLive(&p)
 	}
 
 	return nil
@@ -314,6 +336,8 @@ func (s *PostService) GetStats() (*models.DashboardStats, error) {
 	scheduledPosts, _ := s.postRepo.CountByStatus(models.StatusScheduled)
 	totalViews, _ := s.postRepo.SumViewCount()
 	totalSubscribers, _ := s.subscriberRepo.CountActive()
+	totalAuthors, _ := s.userRepo.CountByRole(models.RoleAuthor)
+	totalAdmins, _ := s.userRepo.CountByRole(models.RoleAdmin)
 
 	return &models.DashboardStats{
 		TotalPosts:       totalPosts,
@@ -322,6 +346,7 @@ func (s *PostService) GetStats() (*models.DashboardStats, error) {
 		ScheduledPosts:   scheduledPosts,
 		TotalViews:       totalViews,
 		TotalSubscribers: totalSubscribers,
+		TotalAuthors:     totalAuthors + totalAdmins,
 	}, nil
 }
 
@@ -330,19 +355,21 @@ func (s *PostService) Search(query string, page, perPage int) (*models.Paginated
 	if err != nil {
 		return nil, err
 	}
+	return paginated(posts, total, page, perPage), nil
+}
 
+func paginated(data interface{}, total int64, page, perPage int) *models.PaginatedResponse {
 	totalPages := int(total) / perPage
 	if int(total)%perPage > 0 {
 		totalPages++
 	}
-
 	return &models.PaginatedResponse{
-		Data:       posts,
+		Data:       data,
 		Total:      total,
 		Page:       page,
 		PerPage:    perPage,
 		TotalPages: totalPages,
-	}, nil
+	}
 }
 
 func (s *PostService) generateUniqueSlug(title string) string {
@@ -369,7 +396,10 @@ func (s *PostService) generateUniqueSlugExcluding(title string, excludeID uint) 
 
 	for {
 		post, err := s.postRepo.FindBySlug(slug)
-		if err != nil || post.ID == excludeID {
+		if err != nil {
+			break
+		}
+		if post != nil && post.ID == excludeID {
 			break
 		}
 		slug = fmt.Sprintf("%s-%d", base, counter)
@@ -390,16 +420,104 @@ func generatePostSlug(s string) string {
 	return slug
 }
 
+// notifyAdminNewPost emails the admin whenever any post is created. Skips the
+// alert if the admin created the post themselves.
+func (s *PostService) notifyAdminNewPost(post *models.Post) {
+	if s.emailService == nil || !s.emailService.IsNotificationEnabled() {
+		return
+	}
+	admin, err := s.userRepo.FindAdmin()
+	if err != nil || admin == nil || admin.ID == post.AuthorID {
+		return
+	}
+	authorName := "an author"
+	if post.Author != nil {
+		authorName = post.Author.DisplayName
+	}
+	headline := authorName + " just created a post"
+	body := "<strong>" + post.Title + "</strong> was created with status <em>" + string(post.Status) + "</em>. Hop into the admin panel if you'd like to review it."
+	if err := s.emailService.SendAdminAlert(admin.Email, "New post: "+post.Title, headline, body); err != nil {
+		log.Printf("notifyAdminNewPost: %v", err)
+	}
+}
+
+// notifyScheduledPostLive emails the post's author + the admin when a
+// scheduled post auto-publishes.
+func (s *PostService) notifyScheduledPostLive(post *models.Post) {
+	if s.emailService == nil || !s.emailService.IsNotificationEnabled() {
+		return
+	}
+	// Notify the author.
+	if post.Author != nil {
+		author, err := s.userRepo.FindByID(post.AuthorID)
+		if err == nil && author != nil {
+			_ = s.emailService.SendAuthorPostStatus(
+				author.Email,
+				author.DisplayName,
+				"Your scheduled post is live",
+				"Your scheduled post just went live on the public site.",
+				post.Title,
+				post.Slug,
+			)
+		}
+	}
+	// FYI the admin (if they aren't the author).
+	if admin, err := s.userRepo.FindAdmin(); err == nil && admin != nil && admin.ID != post.AuthorID {
+		headline := "Scheduled post is live: " + post.Title
+		body := "The scheduled post <strong>" + post.Title + "</strong> was automatically published."
+		_ = s.emailService.SendAdminAlert(admin.Email, "Scheduled post live: "+post.Title, headline, body)
+	}
+}
+
+// notifyPostTakenDown fires when a post moves from published -> offline.
+func (s *PostService) notifyPostTakenDown(post *models.Post) {
+	if s.emailService == nil || !s.emailService.IsNotificationEnabled() {
+		return
+	}
+	if author, err := s.userRepo.FindByID(post.AuthorID); err == nil && author != nil {
+		_ = s.emailService.SendAuthorPostStatus(
+			author.Email,
+			author.DisplayName,
+			"Your post has been taken down",
+			"Your post is no longer visible on the public site. Reach out to the admin if you think this was a mistake.",
+			post.Title,
+			post.Slug,
+		)
+	}
+	if admin, err := s.userRepo.FindAdmin(); err == nil && admin != nil && admin.ID != post.AuthorID {
+		headline := post.Title + " has been taken down"
+		body := "The post <strong>" + post.Title + "</strong> was taken offline."
+		_ = s.emailService.SendAdminAlert(admin.Email, "Post taken down: "+post.Title, headline, body)
+	}
+}
+
 func (s *PostService) notifySubscribers(post *models.Post) {
-	subscribers, err := s.subscriberRepo.FindAllActive()
-	if err != nil {
+	if s.emailService == nil || !s.emailService.IsNewsletterEnabled() {
+		log.Println("Newsletter email not configured, skipping subscriber notification")
 		return
 	}
 
-	// This is where you'd integrate with an email service
-	// For now, just log the notification
+	subscribers, err := s.subscriberRepo.FindAllActive()
+	if err != nil {
+		log.Printf("Failed to fetch subscribers for notification: %v", err)
+		return
+	}
+
+	if len(subscribers) == 0 {
+		return
+	}
+
+	log.Printf("Notifying %d subscribers about new post: %s", len(subscribers), post.Title)
+
 	for _, sub := range subscribers {
-		// TODO: Send email to sub.Email about new post
-		_ = sub // placeholder
+		err := s.emailService.SendNewPostNotification(
+			sub.Email,
+			post.Title,
+			post.Slug,
+			sub.UnsubscribeToken,
+		)
+		if err != nil {
+			log.Printf("Failed to notify subscriber %s: %v", sub.Email, err)
+		}
 	}
 }

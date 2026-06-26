@@ -11,14 +11,16 @@ import (
 )
 
 type PostHandler struct {
-	postService   *services.PostService
-	uploadService *services.UploadService
+	postService     *services.PostService
+	uploadService   *services.UploadService
+	categoryService *services.CategoryService
 }
 
-func NewPostHandler(postService *services.PostService, uploadService *services.UploadService) *PostHandler {
+func NewPostHandler(postService *services.PostService, uploadService *services.UploadService, categoryService *services.CategoryService) *PostHandler {
 	return &PostHandler{
-		postService:   postService,
-		uploadService: uploadService,
+		postService:     postService,
+		uploadService:   uploadService,
+		categoryService: categoryService,
 	}
 }
 
@@ -143,13 +145,20 @@ func (h *PostHandler) GetPostsByCategory(c *gin.Context) {
 		perPage = 10
 	}
 
-	// We need to get category ID from slug first
-	// For simplicity, we'll use the category service here
-	// In a real app, you might inject the category service
-	// For now, we'll just note this is where you'd convert slug to ID
+	slug := c.Param("slug")
+	category, err := h.categoryService.GetBySlug(slug)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
+		return
+	}
 
-	// This is a placeholder - you'd need to inject categoryService
-	c.JSON(http.StatusNotImplemented, gin.H{"error": "not implemented - needs category service integration"})
+	response, err := h.postService.GetPostsByCategory(category.ID, page, perPage)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *PostHandler) Update(c *gin.Context) {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log"
 	"time"
 
 	"blog-backend/internal/models"
@@ -12,10 +13,14 @@ import (
 
 type SubscriberService struct {
 	subscriberRepo *repository.SubscriberRepository
+	email          *EmailService
 }
 
-func NewSubscriberService(subscriberRepo *repository.SubscriberRepository) *SubscriberService {
-	return &SubscriberService{subscriberRepo: subscriberRepo}
+func NewSubscriberService(subscriberRepo *repository.SubscriberRepository, email *EmailService) *SubscriberService {
+	return &SubscriberService{
+		subscriberRepo: subscriberRepo,
+		email:          email,
+	}
 }
 
 func (s *SubscriberService) Subscribe(email string) (*models.Subscriber, error) {
@@ -25,12 +30,14 @@ func (s *SubscriberService) Subscribe(email string) (*models.Subscriber, error) 
 		if existing.IsActive {
 			return nil, errors.New("email already subscribed")
 		}
-		// Reactivate subscription
+		// Reactivate subscription — send a "welcome back" mail so they get
+		// the same confirmation experience as a fresh signup.
 		existing.IsActive = true
 		existing.SubscribedAt = time.Now()
 		if err := s.subscriberRepo.Update(existing); err != nil {
 			return nil, err
 		}
+		go s.sendWelcome(existing)
 		return existing, nil
 	}
 
@@ -51,7 +58,20 @@ func (s *SubscriberService) Subscribe(email string) (*models.Subscriber, error) 
 		return nil, err
 	}
 
+	go s.sendWelcome(subscriber)
+
 	return subscriber, nil
+}
+
+// sendWelcome fires the welcome email off the request goroutine so a slow SMTP
+// hop never makes the subscribe response hang.
+func (s *SubscriberService) sendWelcome(sub *models.Subscriber) {
+	if s.email == nil || !s.email.IsNewsletterEnabled() {
+		return
+	}
+	if err := s.email.SendWelcomeEmail(sub.Email, sub.UnsubscribeToken); err != nil {
+		log.Printf("subscribe: welcome email to %s failed: %v", sub.Email, err)
+	}
 }
 
 func (s *SubscriberService) Unsubscribe(token string) error {

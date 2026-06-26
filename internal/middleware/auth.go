@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	"blog-backend/internal/models"
@@ -86,10 +87,37 @@ func AdminOnly() gin.HandlerFunc {
 
 func CORS() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := os.Getenv("CORS_ORIGINS")
+		if origin == "" {
+			origin = "*"
+		}
+
+		// If multiple origins configured, check against request origin
+		requestOrigin := c.GetHeader("Origin")
+		if origin != "*" && requestOrigin != "" {
+			allowed := false
+			for _, o := range strings.Split(origin, ",") {
+				if strings.TrimSpace(o) == requestOrigin {
+					allowed = true
+					origin = requestOrigin
+					break
+				}
+			}
+			if !allowed {
+				origin = ""
+			}
+		}
+
+		if origin != "" {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
+
+		if origin != "*" {
+			c.Writer.Header().Set("Vary", "Origin")
+		}
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)

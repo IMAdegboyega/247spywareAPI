@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"time"
 
 	"blog-backend/internal/config"
 	"blog-backend/internal/handlers"
 	"blog-backend/internal/middleware"
-	"blog-backend/internal/models"
 	"blog-backend/internal/repository"
 	"blog-backend/internal/services"
 
@@ -26,18 +27,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-
-	// Auto-migrate models
-	if err := db.AutoMigrate(
-		&models.User{},
-		&models.Category{},
-		&models.Post{},
-		&models.EditorPick{},
-		&models.Subscriber{},
-		&models.Advert{},
-	); err != nil {
-		log.Fatalf("Failed to migrate database: %v", err)
-	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = db.Disconnect(ctx)
+	}()
 
 	// Initialize repositories
 	userRepo := repository.NewUserRepository(db)
@@ -47,19 +41,22 @@ func main() {
 	subscriberRepo := repository.NewSubscriberRepository(db)
 	advertRepo := repository.NewAdvertRepository(db)
 
+	// Shared email service — handles both notification (Gmail) and newsletter (Resend) senders
+	emailService := services.NewEmailService()
+
 	// Initialize services
-	authService := services.NewAuthService(userRepo, os.Getenv("JWT_SECRET"))
-	categoryService := services.NewCategoryService(categoryRepo)
-	postService := services.NewPostService(postRepo, subscriberRepo)
+	authService := services.NewAuthService(userRepo, postRepo, emailService, os.Getenv("JWT_SECRET"))
+	categoryService := services.NewCategoryService(categoryRepo, postRepo)
+	postService := services.NewPostService(postRepo, subscriberRepo, userRepo, categoryRepo, emailService)
 	editorPickService := services.NewEditorPickService(editorPickRepo, postRepo)
-	subscriberService := services.NewSubscriberService(subscriberRepo)
+	subscriberService := services.NewSubscriberService(subscriberRepo, emailService)
 	advertService := services.NewAdvertService(advertRepo)
 	uploadService := services.NewUploadService(os.Getenv("UPLOAD_PATH"))
 
 	// Initialize handlers
 	authHandler := handlers.NewAuthHandler(authService)
 	categoryHandler := handlers.NewCategoryHandler(categoryService)
-	postHandler := handlers.NewPostHandler(postService, uploadService)
+	postHandler := handlers.NewPostHandler(postService, uploadService, categoryService)
 	editorPickHandler := handlers.NewEditorPickHandler(editorPickService)
 	subscriberHandler := handlers.NewSubscriberHandler(subscriberService)
 	advertHandler := handlers.NewAdvertHandler(advertService)
@@ -75,9 +72,12 @@ func main() {
 
 	// Public routes
 	public := router.Group("/api")
+	public.Use(middleware.RateLimit(120, 20))
 	{
-		// Auth
-		public.POST("/auth/login", authHandler.Login)
+		// Auth (stricter limit)
+		public.POST("/auth/login", middleware.StrictRateLimit(10, 5), authHandler.Login)
+		public.POST("/auth/forgot-password", middleware.StrictRateLimit(5, 3), authHandler.ForgotPassword)
+		public.POST("/auth/reset-password", middleware.StrictRateLimit(10, 5), authHandler.ResetPassword)
 
 		// Public blog routes
 		public.GET("/posts", postHandler.GetPublishedPosts)
@@ -88,8 +88,8 @@ func main() {
 		public.GET("/editor-picks", editorPickHandler.GetAll)
 		public.GET("/adverts/active", advertHandler.GetActive)
 
-		// Newsletter subscription
-		public.POST("/subscribe", subscriberHandler.Subscribe)
+		// Newsletter subscription (stricter limit)
+		public.POST("/subscribe", middleware.StrictRateLimit(5, 3), subscriberHandler.Subscribe)
 		public.GET("/unsubscribe", subscriberHandler.Unsubscribe)
 	}
 

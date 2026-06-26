@@ -112,3 +112,37 @@ func (h *AuthHandler) ToggleUserActive(c *gin.Context) {
 
 	c.JSON(http.StatusOK, user)
 }
+
+// ForgotPassword starts the reset flow. We always return 200 with the same
+// generic message to avoid leaking which emails exist.
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	var req models.ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_ = h.authService.RequestPasswordReset(req.Email)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "If that email matches an account, a reset link is on its way.",
+	})
+}
+
+// ResetPassword finishes the flow with token + email + new password.
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	var req models.ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.authService.ResetPassword(req.Token, req.Email, req.NewPassword); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Password updated. Try not to forget your password 😒",
+	})
+}
